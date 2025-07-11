@@ -78,7 +78,7 @@ class HiPAttention(nn.Module):
     """
     Hierarchically Pruned (HiP) Attention.
     """
-    def __init__(self, config):
+    def __init__(self, config, causal=True):
         super().__init__()
         assert config.n_embd % config.n_head == 0, "d_model must be divisible by num_heads"
 
@@ -87,6 +87,7 @@ class HiPAttention(nn.Module):
         self.d_head = self.d_model // self.num_heads
         self.chunk_size = 32
         self.top_k_chunks = 8
+        self.causal = causal
 
         self.q_proj = nn.Linear(self.d_model, self.d_model)
         self.k_proj = nn.Linear(self.d_model, self.d_model)
@@ -112,8 +113,8 @@ class HiPAttention(nn.Module):
         for i in range(seq_len_q):
             q_i = q[:, :, i, :].unsqueeze(2) # (batch_size, num_heads, 1, d_head)
             
-            # Get the sparse indices for the current query
-            sparse_indices = self.hierarchical_pruning(q_i, k)
+            # Get the sparse indices for the current query (with causal constraint)
+            sparse_indices = self.hierarchical_pruning(q_i, k, i)
             
             # Gather the selected keys and values
             k_sparse = torch.gather(k, 2, sparse_indices.unsqueeze(-1).expand(-1, -1, -1, self.d_head))
@@ -122,7 +123,14 @@ class HiPAttention(nn.Module):
             # Standard scaled dot-product attention on the sparse keys/values
             scores = torch.matmul(q_i, k_sparse.transpose(-2, -1)) / math.sqrt(self.d_head)
             
-            # Apply mask if provided
+            # Apply causal mask - ensure we only attend to positions <= current position
+            if self.causal:
+                # Create causal mask for sparse indices
+                sparse_positions = sparse_indices.unsqueeze(-1)  # (batch_size, num_heads, num_sparse, 1)
+                causal_mask = sparse_positions.squeeze(-1) > i  # positions > current query position
+                scores = scores.masked_fill(causal_mask.unsqueeze(2), -float('inf'))
+            
+            # Apply additional mask if provided
             if mask is not None:
                 # The mask needs to be adapted for the sparse keys
                 sparse_mask = torch.gather(mask, 1, sparse_indices.squeeze(0).squeeze(0))
@@ -139,21 +147,28 @@ class HiPAttention(nn.Module):
         output = output.transpose(1, 2).contiguous().view(batch_size, seq_len_q, self.d_model)
         return self.out_proj(output)
 
-    def hierarchical_pruning(self, q_i, k):
+    def hierarchical_pruning(self, q_i, k, query_pos):
         """
         Performs hierarchical pruning to find the most relevant keys for a given query.
 
         Args:
             q_i (torch.Tensor): The current query tensor. Shape: (batch_size, num_heads, 1, d_head)
             k (torch.Tensor): The key tensor. Shape: (batch_size, num_heads, seq_len_kv, d_head)
+            query_pos (int): Position of the current query (for causal masking)
 
         Returns:
             torch.Tensor: The indices of the selected keys.
         """
         batch_size, num_heads, seq_len_kv, d_head = k.shape
         
-        # Start with all indices
-        current_indices = torch.arange(seq_len_kv).view(1, 1, -1).expand(batch_size, num_heads, -1).to(k.device)
+        # For causal attention, only consider keys up to current position
+        if self.causal:
+            max_pos = min(query_pos + 1, seq_len_kv)
+            available_indices = torch.arange(max_pos).view(1, 1, -1).expand(batch_size, num_heads, -1).to(k.device)
+        else:
+            available_indices = torch.arange(seq_len_kv).view(1, 1, -1).expand(batch_size, num_heads, -1).to(k.device)
+        
+        current_indices = available_indices
         
         current_chunk_size = self.chunk_size
         
