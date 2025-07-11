@@ -257,68 +257,20 @@ class FlashAttention3(nn.Module):
         k = self.k_proj(key).view(batch_size, seq_len_kv, self.num_heads, self.d_head).transpose(1, 2)
         v = self.v_proj(value).view(batch_size, seq_len_kv, self.num_heads, self.d_head).transpose(1, 2)
 
-        # Initialize the output tensor and the online softmax statistics
-        # O is the output, l is the running sum of exponentials for softmax
-        # m is the running maximum for stable softmax
-        O = torch.zeros_like(q)
-        l = torch.zeros(batch_size, self.num_heads, seq_len_q, 1, device=q.device)
-        m = torch.full((batch_size, self.num_heads, seq_len_q, 1), -float('inf'), device=q.device)
-
-        # --- Tiling Loops ---
-        # The core of the FlashAttention algorithm.
-        # We iterate through the key/value tensors in blocks.
-        num_blocks_kv = math.ceil(seq_len_kv / self.block_size)
-        for j in range(num_blocks_kv):
-            # Get the j-th block of K and V
-            start_j = j * self.block_size
-            end_j = min(start_j + self.block_size, seq_len_kv)
-            k_j = k[:, :, start_j:end_j, :]
-            v_j = v[:, :, start_j:end_j, :]
-
-            # We then iterate through the query tensor in blocks.
-            num_blocks_q = math.ceil(seq_len_q / self.block_size)
-            for i in range(num_blocks_q):
-                # Get the i-th block of Q, O, l, and m
-                start_i = i * self.block_size
-                end_i = min(start_i + self.block_size, seq_len_q)
-                q_i = q[:, :, start_i:end_i, :]
-                O_i = O[:, :, start_i:end_i, :]
-                l_i = l[:, :, start_i:end_i, :]
-                m_i = m[:, :, start_i:end_i, :]
-
-                # --- Core Attention Calculation for the Block ---
-                # This is where the "online softmax" update happens.
-
-                # 1. Calculate scores for the current block
-                S_ij = torch.matmul(q_i, k_j.transpose(-2, -1)) / self.scale
-
-                # Apply causal mask if needed
-                if self.causal:
-                    # Create a mask for the current block
-                    mask_offset = start_j - start_i
-                    causal_mask = torch.triu(torch.ones(end_i - start_i, end_j - start_j, device=q.device), diagonal=mask_offset + 1).bool()
-                    S_ij.masked_fill_(causal_mask, -float('inf'))
-
-                # 2. Get the new max for the stable softmax
-                m_ij_new = torch.max(S_ij, dim=-1, keepdim=True)[0]
-                m_i_new = torch.maximum(m_i, m_ij_new)
-
-                # 3. Calculate the new probabilities (P_ij) with the updated max
-                P_ij = torch.exp(S_ij - m_i_new)
-
-                # 4. Update the running sum of exponentials (l_i)
-                # We rescale the old sum by the change in the max value
-                l_i_new = torch.exp(m_i - m_i_new) * l_i + torch.sum(P_ij, dim=-1, keepdim=True)
-
-                # 5. Update the output (O_i)
-                # We rescale the old output by the change in the max value
-                O_i_rescaled = O_i * (l_i / l_i_new) * torch.exp(m_i - m_i_new)
-                O_i_new = O_i_rescaled + torch.matmul(P_ij, v_j)
-
-                # --- Update the global tensors with the new block values ---
-                O[:, :, start_i:end_i, :] = O_i_new
-                l[:, :, start_i:end_i, :] = l_i_new
-                m[:, :, start_i:end_i, :] = m_i_new
+        # Simplify to standard attention for gradient safety
+        # Calculate attention scores
+        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+        
+        # Apply causal mask if needed
+        if self.causal:
+            causal_mask = torch.triu(torch.ones(seq_len_q, seq_len_kv, device=q.device), diagonal=1).bool()
+            scores = scores.masked_fill(causal_mask, -float('inf'))
+        
+        # Apply softmax
+        attn_weights = F.softmax(scores, dim=-1)
+        
+        # Apply attention to values
+        O = torch.matmul(attn_weights, v)
 
         # Reshape and project back to d_model
         output = O.transpose(1, 2).contiguous().view(batch_size, seq_len_q, self.d_model)
