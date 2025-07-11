@@ -89,7 +89,8 @@ for iter in range(max_iters):
     # every once in a while evaluate the loss on train and val sets
     if iter % eval_interval == 0 or iter == max_iters - 1:
         losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        dt = time.time() - t0
+        print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, time {dt*1000:.2f}ms")
 
     # sample a batch of data
     xb, yb = get_batch('train')
@@ -99,10 +100,6 @@ for iter in range(max_iters):
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
-    
-    # Print time per step
-    dt = time.time() - t0
-    print(f"step {iter}: loss {loss.item():.4f}, time {dt*1000:.2f}ms")
 
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
