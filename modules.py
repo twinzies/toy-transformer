@@ -78,15 +78,15 @@ class HiPAttention(nn.Module):
     """
     Hierarchically Pruned (HiP) Attention.
     """
-    def __init__(self, config, causal=True):
+    def __init__(self, config, causal=True, chunk_size=32, top_k_chunks=8):
         super().__init__()
         assert config.n_embd % config.n_head == 0, "d_model must be divisible by num_heads"
 
         self.d_model = config.n_embd
         self.num_heads = config.n_head
         self.d_head = self.d_model // self.num_heads
-        self.chunk_size = 32
-        self.top_k_chunks = 8
+        self.chunk_size = chunk_size
+        self.top_k_chunks = top_k_chunks
         self.causal = causal
 
         self.q_proj = nn.Linear(self.d_model, self.d_model)
