@@ -214,6 +214,79 @@ class HiPAttention(nn.Module):
 
         return current_indices
     
+class MultiHeadLatentAttention(nn.Module):
+    """
+    Multi-Head Latent Attention (MLA).
+    
+    MLA reduces computational complexity by projecting Q, K, V into a shared
+    lower-dimensional latent space before computing attention, then projecting
+    back to the original dimension.
+    """
+    
+    def __init__(self, config, latent_dim=None):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        
+        self.n_embd = config.n_embd
+        self.n_head = config.n_head
+        self.head_dim = config.n_embd // config.n_head
+        self.latent_dim = latent_dim or config.n_embd // 4  # Default to 1/4 of embedding dim
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+        
+        # Projections to latent space
+        self.q_latent = nn.Linear(config.n_embd, self.latent_dim, bias=False)
+        self.k_latent = nn.Linear(config.n_embd, self.latent_dim, bias=False)
+        self.v_latent = nn.Linear(config.n_embd, self.latent_dim, bias=False)
+        
+        # Head projections from latent space
+        self.q_heads = nn.Linear(self.latent_dim, config.n_embd, bias=False)
+        self.k_heads = nn.Linear(self.latent_dim, config.n_embd, bias=False)
+        self.v_heads = nn.Linear(self.latent_dim, config.n_embd, bias=False)
+        
+        # Output projection
+        self.proj = nn.Linear(config.n_embd, config.n_embd)
+        
+        # Causal mask
+        self.register_buffer("mask", torch.tril(torch.ones(config.block_size, config.block_size)).view(
+            1, 1, config.block_size, config.block_size
+        ))
+        
+        # Dropout
+        self.attn_drop = nn.Dropout(config.dropout)
+        self.resid_drop = nn.Dropout(config.dropout)
+    
+    def forward(self, x):
+        B, T, C = x.size()
+        
+        # Project to latent space
+        q_lat = self.q_latent(x)  # (B, T, latent_dim)
+        k_lat = self.k_latent(x)  # (B, T, latent_dim)
+        v_lat = self.v_latent(x)  # (B, T, latent_dim)
+        
+        # Project from latent to multi-head space
+        q = self.q_heads(q_lat).view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
+        k = self.k_heads(k_lat).view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
+        v = self.v_heads(v_lat).view(B, T, self.n_head, self.head_dim).transpose(1, 2)  # (B, nh, T, hs)
+        
+        # Compute attention scores
+        att = (q @ k.transpose(-2, -1)) * self.scale  # (B, nh, T, T)
+        
+        # Apply causal mask
+        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
+        
+        # Softmax and dropout
+        att = F.softmax(att, dim=-1)
+        att = self.attn_drop(att)
+        
+        # Apply attention to values
+        y = att @ v  # (B, nh, T, hs)
+        
+        # Reshape and apply output projection
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_drop(self.proj(y))
+        
+        return y
+
 class FlashAttention3(nn.Module):
     """
     A from-scratch implementation that simulates the logic of FlashAttention.
